@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Store Card Prices
 // @namespace    local.steam.store.card.prices
-// @version      0.6.4
+// @version      0.6.7
 // @description  在 Steam 商店游戏详情页显示该游戏集换式卡牌的社区市场价格。
 // @author       Codex
 // @license      MIT
@@ -26,6 +26,17 @@
   const MARKET_LISTING_PAGE = "https://steamcommunity.com/market/listings/753/";
   const STEAM_TRANSACTION_FEE_PERCENT = 0.05;
   const DEFAULT_PUBLISHER_FEE_PERCENT = 0.10;
+  const MARKET_FEE_RULES = [
+    {
+      key: "minimum-seven-per-part",
+      minimumFee: 7,
+      currencyCodes: ["CNY", "HKD"],
+      currencyIds: [23, 29],
+      countries: ["CN", "HK"],
+      priceTextPatterns: [/\bCNY\b/i, /\bRMB\b/i, /CN¥/i, /人民币|人民幣/, /\bHKD\b/i, /HK\$/i, /港币|港幣/],
+      decimalPriceTextPatterns: [/¥|￥/],
+    },
+  ];
   const CURRENCY_CODES_TO_ROUND = [
     "JPY",
     "IDR",
@@ -380,7 +391,7 @@
       return {
         ...card,
         publisherFeePercent,
-        netPrice: calculateSellerReceives(card.sellPrice, publisherFeePercent, card.minimumFee),
+        netPrice: calculateSellerReceives(card.sellPrice, publisherFeePercent, card.minimumFee, card.marketFeeRuleKey),
         buyPrice: order.buyPrice,
         buyOrderCount: order.buyOrderCount,
         buyPriceError: false,
@@ -463,6 +474,7 @@
     const sellPrice = Number.isFinite(Number(item.sell_price)) ? Number(item.sell_price) : null;
     const publisherFeePercent = readPublisherFeeFromItem(item);
     const priceFormat = inferPriceFormat(sellPrice, String(item.sell_price_text || item.sale_price_text || ""));
+    const marketFeeRuleKey = priceFormat.marketFeeRuleKey || "";
 
     return {
       foil,
@@ -472,10 +484,11 @@
       type: String(desc.type || "").trim(),
       listings: parseInt(item.sell_listings, 10) || 0,
       sellPrice,
-      netPrice: calculateSellerReceives(sellPrice, publisherFeePercent, priceFormat.minimumFee),
+      netPrice: calculateSellerReceives(sellPrice, publisherFeePercent, priceFormat.minimumFee, marketFeeRuleKey),
       publisherFeePercent,
       priceUnit: priceFormat.unit,
       minimumFee: priceFormat.minimumFee,
+      marketFeeRuleKey,
       sellPriceText: String(item.sell_price_text || "").trim(),
       salePriceText: String(item.sale_price_text || "").trim(),
       buyPrice: null,
@@ -823,7 +836,7 @@
   }
 
   function cacheKey(appid, settings) {
-    return `sscp-cache-v5:${appid}:${querySignature(settings)}`;
+    return `sscp-cache-v8:${appid}:${querySignature(settings)}`;
   }
 
   function querySignature(settings) {
@@ -860,11 +873,11 @@
       : getWalletInfo().wallet_publisher_fee_percent_default;
   }
 
-  function calculateSellerReceives(buyerPaysCents, publisherFeePercent = DEFAULT_PUBLISHER_FEE_PERCENT, minimumFee) {
+  function calculateSellerReceives(buyerPaysCents, publisherFeePercent = DEFAULT_PUBLISHER_FEE_PERCENT, minimumFee, marketFeeRuleKey) {
     const amount = Math.round(Number(buyerPaysCents));
     if (!Number.isFinite(amount) || amount <= 0) return null;
 
-    const feeInfo = calculateFeeAmount(amount, publisherFeePercent, getWalletInfo(minimumFee));
+    const feeInfo = calculateFeeAmount(amount, publisherFeePercent, getWalletInfo(minimumFee, marketFeeRuleKey));
     return amount > feeInfo.fees ? amount - feeInfo.fees : 1;
   }
 
@@ -883,7 +896,7 @@
     let everUndershot = false;
     let fees = calculateAmountToSendForDesiredReceivedAmount(estimatedReceived, publisherFee, walletInfo);
 
-    while (fees.amount !== amount && iterations < 10) {
+    while (fees.amount !== amount && iterations < 100) {
       if (fees.amount > amount) {
         if (everUndershot) {
           fees = calculateAmountToSendForDesiredReceivedAmount(estimatedReceived - 1, publisherFee, walletInfo);
@@ -908,15 +921,15 @@
 
   function calculateAmountToSendForDesiredReceivedAmount(receivedAmount, publisherFee, walletInfo) {
     const roundFee = shouldRoundFees(walletInfo) ? Math.round : Math.floor;
-    const minFee = Number(walletInfo.wallet_fee_minimum) || 1;
+    const minFee = getMinimumFeeForWallet(walletInfo);
     publisherFee = publisherFee == null ? 0 : publisherFee;
 
     const steamFee = Math.max(
-      parseInt(roundFee(receivedAmount * parseFloat(walletInfo.wallet_fee_percent) + parseInt(walletInfo.wallet_fee_base, 10)), 10),
+      roundFee(receivedAmount * parseFloat(walletInfo.wallet_fee_percent) + parseInt(walletInfo.wallet_fee_base, 10)),
       minFee
     );
     const publisherFeeAmount = publisherFee > 0
-      ? Math.max(parseInt(roundFee(receivedAmount * publisherFee), 10), minFee)
+      ? Math.max(roundFee(receivedAmount * publisherFee), minFee)
       : 0;
     const amountToSend = receivedAmount + steamFee + publisherFeeAmount;
 
@@ -924,14 +937,14 @@
       steam_fee: steamFee,
       publisher_fee: publisherFeeAmount,
       fees: steamFee + publisherFeeAmount,
-      amount: parseInt(amountToSend, 10),
+      amount: amountToSend,
     };
   }
 
-  function getWalletInfo(minimumFee) {
+  function getWalletInfo(minimumFee, marketFeeRuleKey) {
     const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
     const raw = pageWindow?.g_rgWalletInfo || {};
-    return {
+    const walletInfo = {
       wallet_fee_base: Number(raw.wallet_fee_base ?? 0),
       wallet_fee_percent: Number(raw.wallet_fee_percent ?? STEAM_TRANSACTION_FEE_PERCENT),
       wallet_fee_minimum: Number(raw.wallet_fee_minimum ?? minimumFee ?? 1),
@@ -939,10 +952,51 @@
       wallet_currency: raw.wallet_currency,
       wallet_country: raw.wallet_country || "US",
     };
+    walletInfo.marketFeeRule = resolveMarketFeeRule({ key: marketFeeRuleKey, walletInfo });
+    return walletInfo;
+  }
+
+  function getMinimumFeeForWallet(walletInfo) {
+    const ruleMinimumFee = Number(walletInfo.marketFeeRule?.minimumFee);
+    if (Number.isFinite(ruleMinimumFee) && ruleMinimumFee > 0) return ruleMinimumFee;
+    return Number(walletInfo.wallet_fee_minimum) || 1;
+  }
+
+  function resolveMarketFeeRule({ key, walletInfo, priceText, decimals = 0 } = {}) {
+    const keyRule = key ? MARKET_FEE_RULES.find(rule => rule.key === key) : null;
+    if (keyRule) return keyRule;
+
+    return MARKET_FEE_RULES.find(rule => (
+      marketFeeRuleMatchesWallet(rule, walletInfo) ||
+      marketFeeRuleMatchesPriceText(rule, priceText, decimals)
+    )) || null;
+  }
+
+  function marketFeeRuleMatchesWallet(rule, walletInfo) {
+    if (!walletInfo) return false;
+
+    const currencyCode = getCurrencyCode(walletInfo);
+    const currencyId = Number(walletInfo.wallet_currency);
+    const country = String(walletInfo.wallet_country || "").toUpperCase();
+
+    return (
+      (currencyCode && rule.currencyCodes.includes(currencyCode)) ||
+      (Number.isFinite(currencyId) && rule.currencyIds.includes(currencyId)) ||
+      (country && rule.countries.includes(country))
+    );
+  }
+
+  function marketFeeRuleMatchesPriceText(rule, text, decimals) {
+    const value = String(text || "");
+    if (!value) return false;
+
+    return (
+      (rule.priceTextPatterns || []).some(pattern => pattern.test(value)) ||
+      (decimals > 0 && (rule.decimalPriceTextPatterns || []).some(pattern => pattern.test(value)))
+    );
   }
 
   function shouldRoundFees(walletInfo) {
-    const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
     const currencyCode = getCurrencyCode(walletInfo);
     return CURRENCY_CODES_TO_ROUND.includes(currencyCode);
   }
@@ -957,7 +1011,8 @@
     const unit = nearestUnit(ratio);
     const decimals = parsed.decimals;
     const minimumFee = decimals === 0 ? unit : 1;
-    return { unit, decimals, minimumFee };
+    const marketFeeRule = resolveMarketFeeRule({ priceText: sampleText, decimals });
+    return { unit, decimals, minimumFee, marketFeeRuleKey: marketFeeRule?.key || "" };
   }
 
   function parsePriceTextNumber(text) {
@@ -968,13 +1023,22 @@
     if (!raw) return null;
 
     const info = readSampleDecimalInfo(raw);
-    const normalized = info.decimals > 0
-      ? raw.replace(new RegExp(`\\${info.separator}(?=[^${info.separator}]*$)`), ".").replace(/[,\s]/g, "")
-      : raw.replace(/[.,\s]/g, "");
+    const normalized = normalizePriceNumber(raw, info);
     const value = Number(normalized);
     return Number.isFinite(value)
       ? { value, decimals: info.decimals }
       : null;
+  }
+
+  function normalizePriceNumber(raw, decimalInfo) {
+    if (decimalInfo.decimals === 0) {
+      return raw.replace(/[.,\s]/g, "");
+    }
+
+    const decimalIndex = raw.lastIndexOf(decimalInfo.separator);
+    const whole = raw.slice(0, decimalIndex).replace(/[.,\s]/g, "");
+    const fraction = raw.slice(decimalIndex + 1).replace(/[^\d]/g, "");
+    return `${whole}.${fraction}`;
   }
 
   function nearestUnit(ratio) {
