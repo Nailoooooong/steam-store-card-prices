@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Store Card Prices
 // @namespace    local.steam.store.card.prices
-// @version      0.7.0
+// @version      0.7.1
 // @description  在 Steam 商店游戏详情页显示该游戏集换式卡牌的社区市场价格。
 // @author       Codex
 // @license      MIT
@@ -399,12 +399,15 @@
         buyOrderCount: order.buyOrderCount,
         buyPriceError: false,
       };
-    } catch (_) {
+    } catch (error) {
+      const message = getErrorMessage(error);
+      console.warn("[Steam Store Card Prices] 求购价查询失败", card.hashName, message, card.marketUrl);
       return {
         ...card,
         buyPrice: null,
         buyOrderCount: 0,
         buyPriceError: true,
+        buyPriceErrorMessage: message,
       };
     }
   }
@@ -424,7 +427,7 @@
     const buyOrderCount = readNumber(normalized, /"cBuyOrders"\s*:\s*(\d+)/);
 
     if (buyPrice == null && buyOrderCount == null) {
-      throw new Error("未找到求购订单数据");
+      throw new Error(describeMissingBuyOrderData(html));
     }
 
     return {
@@ -438,6 +441,20 @@
     if (!match) return null;
     const value = Number(match[1]);
     return Number.isFinite(value) ? value : null;
+  }
+
+  function describeMissingBuyOrderData(html) {
+    const text = String(html || "");
+    if (!text) return "市场详情页返回空内容";
+    if (/too many requests|rate limit|请求过于频繁/i.test(text)) return "Steam 限流";
+    if (/access denied|forbidden|拒绝访问/i.test(text)) return "Steam 拒绝访问";
+    if (/login|sign in|登录/i.test(text) && !/amtMaxBuyOrder|cBuyOrders/.test(text)) return "市场详情页返回登录页";
+    return "市场详情页未包含求购订单摘要";
+  }
+
+  function getErrorMessage(error) {
+    const message = String(error?.message || error || "").trim();
+    return message || "未知错误";
   }
 
   function buildMarketApiUrl(appid, foil, start, count) {
@@ -712,10 +729,20 @@
 
   function renderBuyPrice(card, group) {
     if (!group.buyQueried) return "未查询";
-    if (card.buyPriceError) return "失败";
+    if (card.buyPriceError) return renderBuyPriceError(card);
     if (!Number.isFinite(card.buyPrice)) return "无数据";
     if (card.buyPrice <= 0) return "无求购";
     return formatLikeSteam(card.buyPrice, card.sellPriceText || card.salePriceText || "", card.priceUnit);
+  }
+
+  function renderBuyPriceError(card) {
+    const message = String(card.buyPriceErrorMessage || "").trim();
+    return message ? `失败：${shortenText(message, 16)}` : "失败";
+  }
+
+  function shortenText(text, maxLength) {
+    const value = String(text || "");
+    return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
   }
 
   function getJson(url) {
