@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Store Card Prices
 // @namespace    local.steam.store.card.prices
-// @version      0.6.7
+// @version      0.6.8
 // @description  在 Steam 商店游戏详情页显示该游戏集换式卡牌的社区市场价格。
 // @author       Codex
 // @license      MIT
@@ -26,6 +26,9 @@
   const MARKET_LISTING_PAGE = "https://steamcommunity.com/market/listings/753/";
   const STEAM_TRANSACTION_FEE_PERCENT = 0.05;
   const DEFAULT_PUBLISHER_FEE_PERCENT = 0.10;
+  const BUY_ORDER_CONCURRENCY = 1;
+  const REQUEST_RETRY_COUNT = 2;
+  const REQUEST_RETRY_DELAY_MS = 800;
   const MARKET_FEE_RULES = [
     {
       key: "minimum-seven-per-part",
@@ -377,7 +380,7 @@
 
     if (includeBuyOrders && group.cards.length) {
       group.buyQueried = true;
-      group.cards = await mapLimit(group.cards, 3, async card => enrichBuyOrder(card));
+      group.cards = await mapLimit(group.cards, BUY_ORDER_CONCURRENCY, async card => enrichBuyOrder(card));
     }
 
     return group;
@@ -407,7 +410,7 @@
   }
 
   function parsePublisherFeePercent(html) {
-    const normalized = String(html || "").replace(/\\/g, "");
+    const normalized = normalizeMarketDataText(html);
     const match = normalized.match(/"publisherFeePct"\s*:\s*([0-9.]+)/);
     if (!match) return null;
 
@@ -416,18 +419,31 @@
   }
 
   function parseBuyOrderHtml(html) {
-    const normalized = String(html || "").replace(/\\/g, "");
-    const buyPrice = readNumber(normalized, /"amtMaxBuyOrder"\s*:\s*(\d+)/);
-    const buyOrderCount = readNumber(normalized, /"cBuyOrders"\s*:\s*(\d+)/);
+    const normalized = normalizeMarketDataText(html);
+    const buyPrice = readNumber(normalized, /"amtMaxBuyOrder"\s*:\s*(\d+)/)
+      ?? readCompactOrderPrice(normalized, "rgCompactBuyOrders");
+    const buyOrderCount = readNumber(normalized, /"cBuyOrders"\s*:\s*(\d+)/)
+      ?? readCompactOrderCount(normalized, "rgCompactBuyOrders");
 
     if (buyPrice == null && buyOrderCount == null) {
-      throw new Error("未找到求购订单数据");
+      return {
+        buyPrice: null,
+        buyOrderCount: 0,
+      };
     }
 
     return {
-      buyPrice: buyPrice || 0,
+      buyPrice,
       buyOrderCount: buyOrderCount || 0,
     };
+  }
+
+  function normalizeMarketDataText(text) {
+    return String(text || "")
+      .replace(/&quot;|&#34;|&#x22;/gi, '"')
+      .replace(/\\u0026/g, "&")
+      .replace(/\\+"/g, '"')
+      .replace(/\\/g, "");
   }
 
   function readNumber(text, pattern) {
@@ -435,6 +451,36 @@
     if (!match) return null;
     const value = Number(match[1]);
     return Number.isFinite(value) ? value : null;
+  }
+
+  function readCompactOrderPrice(text, key) {
+    const values = readNumberArray(text, key);
+    return values.length >= 2 ? values[0] : null;
+  }
+
+  function readCompactOrderCount(text, key) {
+    const values = readNumberArray(text, key);
+    if (values.length < 2) return null;
+
+    let count = 0;
+    for (let index = 1; index < values.length; index += 2) {
+      count += values[index];
+    }
+    return count;
+  }
+
+  function readNumberArray(text, key) {
+    const escapedKey = escapeRegExp(key);
+    const match = String(text || "").match(new RegExp(`"${escapedKey}"\\s*:\\s*\\[([\\d,\\s]+)\\]`));
+    if (!match) return [];
+
+    return match[1].split(",")
+      .map(value => Number(value.trim()))
+      .filter(value => Number.isFinite(value));
+  }
+
+  function escapeRegExp(text) {
+    return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   function buildMarketApiUrl(appid, foil, start, count) {
@@ -716,7 +762,7 @@
   }
 
   function getJson(url) {
-    return requestText(url).then(text => {
+    return requestTextWithRetry(url).then(text => {
       try {
         return JSON.parse(text);
       } catch (_) {
@@ -726,7 +772,31 @@
   }
 
   function getText(url) {
-    return requestText(url);
+    return requestTextWithRetry(url);
+  }
+
+  async function requestTextWithRetry(url) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= REQUEST_RETRY_COUNT; attempt++) {
+      try {
+        return await requestText(url);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= REQUEST_RETRY_COUNT || !shouldRetryRequest(error)) break;
+        await delay(REQUEST_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+
+    throw lastError || new Error("Steam 市场请求失败");
+  }
+
+  function shouldRetryRequest(error) {
+    return /HTTP (?:429|5\d\d)|网络请求失败|请求超时/.test(String(error?.message || ""));
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => window.setTimeout(resolve, ms));
   }
 
   function requestText(url) {
@@ -743,6 +813,8 @@
       request({
         method: "GET",
         url,
+        anonymous: false,
+        responseType: "text",
         headers: {
           "Accept": "application/json,text/html,text/plain,*/*",
         },
