@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Store Card Prices
 // @namespace    local.steam.store.card.prices
-// @version      0.6.8
+// @version      0.6.9
 // @description  在 Steam 商店游戏详情页显示该游戏集换式卡牌的社区市场价格。
 // @author       Codex
 // @license      MIT
@@ -24,6 +24,7 @@
   const MARKET_SEARCH_API = "https://steamcommunity.com/market/search/render/";
   const MARKET_SEARCH_PAGE = "https://steamcommunity.com/market/search";
   const MARKET_LISTING_PAGE = "https://steamcommunity.com/market/listings/753/";
+  const MARKET_ORDERBOOK_API = "https://steamcommunity.com/market/orderbook";
   const STEAM_TRANSACTION_FEE_PERCENT = 0.05;
   const DEFAULT_PUBLISHER_FEE_PERCENT = 0.10;
   const BUY_ORDER_CONCURRENCY = 1;
@@ -388,9 +389,8 @@
 
   async function enrichBuyOrder(card) {
     try {
-      const html = await getText(card.marketUrl);
-      const order = parseBuyOrderHtml(html);
-      const publisherFeePercent = parsePublisherFeePercent(html) ?? card.publisherFeePercent;
+      const order = await fetchBuyOrder(card);
+      const publisherFeePercent = order.publisherFeePercent ?? card.publisherFeePercent;
       return {
         ...card,
         publisherFeePercent,
@@ -405,6 +405,19 @@
         buyPrice: null,
         buyOrderCount: 0,
         buyPriceError: true,
+      };
+    }
+  }
+
+  async function fetchBuyOrder(card) {
+    try {
+      const data = await getJson(buildOrderBookUrl(card.hashName));
+      return parseBuyOrderBook(data);
+    } catch (_) {
+      const html = await getText(card.marketUrl);
+      return {
+        ...parseBuyOrderHtml(html),
+        publisherFeePercent: parsePublisherFeePercent(html),
       };
     }
   }
@@ -438,6 +451,28 @@
     };
   }
 
+  function parseBuyOrderBook(data) {
+    const source = data?.data || data || {};
+    if (data?.success === false) {
+      throw new Error("Steam 市场订单簿返回失败状态");
+    }
+
+    const buyPrice = readObjectNumber(source, "amtMaxBuyOrder")
+      ?? readCompactOrderPrice(source.rgCompactBuyOrders);
+    const buyOrderCount = readObjectNumber(source, "cBuyOrders")
+      ?? readCompactOrderCount(source.rgCompactBuyOrders);
+
+    if (buyPrice == null && buyOrderCount == null) {
+      throw new Error("Steam 市场订单簿缺少求购数据");
+    }
+
+    return {
+      buyPrice,
+      buyOrderCount: buyOrderCount || 0,
+      publisherFeePercent: null,
+    };
+  }
+
   function normalizeMarketDataText(text) {
     return String(text || "")
       .replace(/&quot;|&#34;|&#x22;/gi, '"')
@@ -453,13 +488,13 @@
     return Number.isFinite(value) ? value : null;
   }
 
-  function readCompactOrderPrice(text, key) {
-    const values = readNumberArray(text, key);
+  function readCompactOrderPrice(source, key) {
+    const values = readOrderArray(source, key);
     return values.length >= 2 ? values[0] : null;
   }
 
-  function readCompactOrderCount(text, key) {
-    const values = readNumberArray(text, key);
+  function readCompactOrderCount(source, key) {
+    const values = readOrderArray(source, key);
     if (values.length < 2) return null;
 
     let count = 0;
@@ -469,7 +504,16 @@
     return count;
   }
 
+  function readOrderArray(source, key) {
+    if (Array.isArray(source)) {
+      return source.map(value => Number(value)).filter(value => Number.isFinite(value));
+    }
+
+    return readNumberArray(source, key);
+  }
+
   function readNumberArray(text, key) {
+    if (!key) return [];
     const escapedKey = escapeRegExp(key);
     const match = String(text || "").match(new RegExp(`"${escapedKey}"\\s*:\\s*\\[([\\d,\\s]+)\\]`));
     if (!match) return [];
@@ -477,6 +521,11 @@
     return match[1].split(",")
       .map(value => Number(value.trim()))
       .filter(value => Number.isFinite(value));
+  }
+
+  function readObjectNumber(object, key) {
+    const value = Number(object?.[key]);
+    return Number.isFinite(value) ? value : null;
   }
 
   function escapeRegExp(text) {
@@ -508,6 +557,13 @@
       params.append("category_753_cardborder[]", foil ? "tag_cardborder_1" : "tag_cardborder_0");
     }
     return `${MARKET_SEARCH_PAGE}?${params.toString()}`;
+  }
+
+  function buildOrderBookUrl(hashName) {
+    const params = new URLSearchParams();
+    params.set("q", "Load");
+    params.set("qp", JSON.stringify([753, hashName]));
+    return `${MARKET_ORDERBOOK_API}?${params.toString()}`;
   }
 
   function normalizeCard(item, foil) {
@@ -824,7 +880,7 @@
             reject(new Error(`Steam 市场请求失败: HTTP ${response.status}`));
             return;
           }
-          resolve(response.responseText || "");
+          resolve(readResponseText(response));
         },
         onerror() {
           reject(new Error("Steam 市场网络请求失败"));
@@ -834,6 +890,19 @@
         },
       });
     });
+  }
+
+  function readResponseText(response) {
+    if (typeof response?.responseText === "string" && response.responseText) {
+      return response.responseText;
+    }
+    if (typeof response?.response === "string") {
+      return response.response;
+    }
+    if (response?.response != null) {
+      return String(response.response);
+    }
+    return "";
   }
 
   async function mapLimit(items, limit, mapper) {
@@ -908,7 +977,7 @@
   }
 
   function cacheKey(appid, settings) {
-    return `sscp-cache-v8:${appid}:${querySignature(settings)}`;
+    return `sscp-cache-v9:${appid}:${querySignature(settings)}`;
   }
 
   function querySignature(settings) {
